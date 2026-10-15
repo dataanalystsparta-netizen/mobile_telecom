@@ -1,7 +1,5 @@
 
 import re
-import secrets
-import string
 
 import streamlit as st
 from supabase import create_client
@@ -21,27 +19,20 @@ st.set_page_config(
 # DATABASE CONNECTIONS
 # --------------------------------------------------
 def get_supabase():
-    """Normal client for authenticated CRM operations."""
     if "supabase_client" not in st.session_state:
         st.session_state["supabase_client"] = create_client(
             st.secrets["SUPABASE_URL"],
             st.secrets["SUPABASE_KEY"],
         )
-
     return st.session_state["supabase_client"]
 
 
 def get_admin_supabase():
-    """
-    Privileged backend client.
-    Never use this client for ordinary sales operations.
-    """
     if "admin_supabase_client" not in st.session_state:
         st.session_state["admin_supabase_client"] = create_client(
             st.secrets["SUPABASE_URL"],
             st.secrets["SUPABASE_SERVICE_ROLE_KEY"],
         )
-
     return st.session_state["admin_supabase_client"]
 
 
@@ -52,9 +43,6 @@ except Exception:
     st.stop()
 
 
-# --------------------------------------------------
-# CONSTANTS
-# --------------------------------------------------
 ROLES = {
     "Sales Agent": "agent",
     "Department Staff": "department_staff",
@@ -87,38 +75,46 @@ def load_profile(user_id):
         .limit(1)
         .execute()
     )
-
     return result.data[0] if result.data else None
 
 
 def get_verified_session_user():
-    """
-    Validate the actual Supabase Auth session rather than
-    trusting a user ID stored in Streamlit session state.
-    """
     try:
         response = supabase.auth.get_user()
         user = response.user
 
-        if not user:
-            return None
-
-        if str(user.id) != str(st.session_state.get("user_id")):
+        if (
+            not user
+            or str(user.id) != str(st.session_state.get("user_id"))
+        ):
             return None
 
         return user
-
     except Exception:
         return None
 
 
+def require_active_admin():
+    user = get_verified_session_user()
+    if not user:
+        raise PermissionError("Authentication required.")
+
+    profile = load_profile(user.id)
+    if (
+        not profile
+        or not profile["is_active"]
+        or profile["role"] != "admin"
+    ):
+        raise PermissionError("Active Admin access is required.")
+
+    return profile
+
+
 # --------------------------------------------------
-# USERNAME-BASED LOGIN
+# USERNAME LOGIN
 # --------------------------------------------------
 if "user_id" in st.session_state:
-    authenticated_user = get_verified_session_user()
-
-    if not authenticated_user:
+    if not get_verified_session_user():
         st.session_state.clear()
         st.rerun()
 
@@ -129,16 +125,8 @@ if "user_id" not in st.session_state:
     st.subheader("Sign in")
 
     with st.form("login_form"):
-        username = st.text_input(
-            "Username",
-            placeholder="Enter your username",
-        )
-
-        password = st.text_input(
-            "Password",
-            type="password",
-        )
-
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
         submitted = st.form_submit_button(
             "Sign in",
             use_container_width=True,
@@ -149,13 +137,10 @@ if "user_id" not in st.session_state:
 
         if not username or not password:
             st.warning("Enter your username and password.")
-
         else:
             try:
                 admin_client = get_admin_supabase()
 
-                # Resolve the username to its Auth account.
-                # This lookup stays on the server.
                 profile_result = (
                     admin_client.table("profiles")
                     .select("id, username, is_active")
@@ -172,17 +157,12 @@ if "user_id" not in st.session_state:
 
                 if not login_profile or not login_profile["is_active"]:
                     st.error("Invalid username or password.")
-
                 else:
-                    # Obtain the existing Auth email for this user.
-                    # Existing accounts retain their current email;
-                    # newly created accounts use an internal identifier.
                     auth_result = (
                         admin_client.auth.admin.get_user_by_id(
                             str(login_profile["id"])
                         )
                     )
-
                     auth_user = auth_result.user
                     auth_email = (
                         getattr(auth_user, "email", None)
@@ -192,7 +172,6 @@ if "user_id" not in st.session_state:
 
                     if not auth_email:
                         st.error("Unable to authenticate this account.")
-
                     else:
                         response = supabase.auth.sign_in_with_password({
                             "email": auth_email,
@@ -201,17 +180,15 @@ if "user_id" not in st.session_state:
 
                         if not response.user:
                             st.error("Invalid username or password.")
-
                         else:
                             profile = load_profile(response.user.id)
 
                             if not profile or not profile["is_active"]:
                                 supabase.auth.sign_out()
                                 st.error(
-                                    "This account is inactive or "
+                                    "Your account is inactive or "
                                     "has no CRM profile."
                                 )
-
                             else:
                                 st.session_state["user_id"] = str(
                                     response.user.id
@@ -221,16 +198,14 @@ if "user_id" not in st.session_state:
 
             except Exception:
                 st.error(
-                    "Sign-in failed. Check your credentials and "
-                    "try again. Contact the administrator if the "
-                    "problem persists."
+                    "Sign-in failed. Check your credentials and try again."
                 )
 
     st.stop()
 
 
 # --------------------------------------------------
-# VERIFY CURRENT USER AND PROFILE
+# VERIFY CURRENT USER
 # --------------------------------------------------
 authenticated_user = get_verified_session_user()
 
@@ -260,44 +235,15 @@ user_id = str(profile["id"])
 
 
 # --------------------------------------------------
-# SECURE ADMIN AUTHORISATION
-# --------------------------------------------------
-def require_active_admin():
-    """
-    Re-check identity and current database permissions before
-    performing any privileged operation.
-    """
-    verified_user = get_verified_session_user()
-
-    if not verified_user:
-        raise PermissionError("Your session is not authenticated.")
-
-    current_profile = load_profile(verified_user.id)
-
-    if (
-        not current_profile
-        or not current_profile["is_active"]
-        or current_profile["role"] != "admin"
-    ):
-        raise PermissionError(
-            "Only an active Admin can perform this operation."
-        )
-
-    return current_profile
-
-
-# --------------------------------------------------
 # SIDEBAR
 # --------------------------------------------------
 with st.sidebar:
     st.title("📋 Sales CRM")
     st.divider()
-
     st.write(f"**User:** {profile['full_name']}")
     st.write(f"**Username:** {profile.get('username') or '-'}")
     st.write(f"**Role:** {role.replace('_', ' ').title()}")
     st.write(f"**Department:** {profile['department'] or '-'}")
-
     st.divider()
 
     if st.button("Sign out", use_container_width=True):
@@ -314,19 +260,15 @@ with st.sidebar:
 if role == "admin":
     st.title("🛡️ Admin Dashboard")
     st.caption("Organisation-wide sales management")
-
 elif role == "manager":
     st.title("📊 Manager Dashboard")
     st.caption("Sales oversight and Live authorisation")
-
 elif role == "department_staff":
     st.title("📂 Department Dashboard")
     st.caption("Department operations")
-
 elif role == "agent":
     st.title("💼 My Sales Dashboard")
     st.caption("Your sales and application progress")
-
 else:
     st.error("Unrecognised account role.")
     st.stop()
@@ -339,47 +281,23 @@ if role == "admin":
     st.divider()
     st.subheader("👥 User Management")
 
-    st.caption(
-        "Create employee accounts and assign their CRM permissions. "
-        "Employees sign in using a username and password."
-    )
-
     with st.expander("➕ Create New User", expanded=False):
         with st.form("create_user_form", clear_on_submit=True):
-            full_name = st.text_input(
-                "Employee Full Name *",
-                placeholder="Enter employee name",
-            )
-
-            new_username = st.text_input(
-                "Username *",
-                placeholder="e.g. john.smith",
-                help=(
-                    "Use 3–32 characters: letters, numbers, "
-                    "full stops, underscores or hyphens."
-                ),
-            )
-
+            full_name = st.text_input("Employee Full Name *")
+            new_username = st.text_input("Username *")
             new_password = st.text_input(
                 "Initial Password *",
                 type="password",
-                help="Use at least 8 characters.",
             )
-
             confirm_password = st.text_input(
                 "Confirm Password *",
                 type="password",
             )
-
             selected_role_label = st.selectbox(
                 "Role *",
                 list(ROLES.keys()),
             )
-
-            department = st.selectbox(
-                "Department *",
-                DEPARTMENTS,
-            )
+            department = st.selectbox("Department *", DEPARTMENTS)
 
             create_user = st.form_submit_button(
                 "Create Employee Account",
@@ -390,7 +308,7 @@ if role == "admin":
             full_name = full_name.strip()
             new_username = new_username.strip().lower()
 
-            username_valid = bool(
+            valid_username = bool(
                 re.fullmatch(
                     r"[a-z0-9][a-z0-9._-]{2,31}",
                     new_username,
@@ -399,31 +317,22 @@ if role == "admin":
 
             if not full_name:
                 st.warning("Employee Full Name is required.")
-
-            elif not username_valid:
+            elif not valid_username:
                 st.warning(
-                    "Username must contain 3–32 characters, start "
-                    "with a letter or number, and use only letters, "
-                    "numbers, full stops, underscores or hyphens."
+                    "Username must be 3–32 characters and contain "
+                    "only letters, numbers, dots, underscores or hyphens."
                 )
-
             elif len(new_password) < 8:
-                st.warning(
-                    "The initial password must be at least 8 characters."
-                )
-
+                st.warning("Password must be at least 8 characters.")
             elif new_password != confirm_password:
-                st.warning("The passwords do not match.")
-
+                st.warning("Passwords do not match.")
             else:
                 created_user_id = None
 
                 try:
-                    # Verify the caller immediately before privileged work.
                     require_active_admin()
                     admin_client = get_admin_supabase()
 
-                    # Check for a duplicate username.
                     duplicate = (
                         admin_client.table("profiles")
                         .select("id")
@@ -433,70 +342,57 @@ if role == "admin":
                     )
 
                     if duplicate.data:
-                        st.warning(
-                            "That username already exists. "
-                            "Choose another username."
+                        st.warning("That username already exists.")
+                    else:
+                        internal_email = (
+                            f"{new_username}@crm-login.invalid"
                         )
-                        st.stop()
 
-                    # Supabase Auth requires an email identifier for
-                    # password authentication. This internal identifier
-                    # is never displayed as the employee's login.
-                    # Email confirmation is set explicitly, so no
-                    # invitation or confirmation email is needed.
-                    internal_email = (
-                        f"{new_username}@crm-login.invalid"
-                    )
+                        auth_response = (
+                            admin_client.auth.admin.create_user({
+                                "email": internal_email,
+                                "password": new_password,
+                                "email_confirm": True,
+                                "user_metadata": {
+                                    "full_name": full_name,
+                                    "username": new_username,
+                                },
+                            })
+                        )
 
-                    auth_response = admin_client.auth.admin.create_user({
-                        "email": internal_email,
-                        "password": new_password,
-                        "email_confirm": True,
-                        "user_metadata": {
-                            "full_name": full_name,
-                            "username": new_username,
-                        },
-                    })
+                        if not auth_response.user:
+                            st.error("Unable to create the Auth account.")
+                        else:
+                            created_user_id = str(
+                                auth_response.user.id
+                            )
 
-                    if not auth_response.user:
-                        st.error("Supabase could not create the account.")
-                        st.stop()
+                            (
+                                admin_client.table("profiles")
+                                .update({
+                                    "full_name": full_name,
+                                    "username": new_username,
+                                    "role": ROLES[selected_role_label],
+                                    "department": department,
+                                    "is_active": True,
+                                })
+                                .eq("id", created_user_id)
+                                .execute()
+                            )
 
-                    created_user_id = str(auth_response.user.id)
-
-                    # The existing database trigger creates a default
-                    # profile. Update it with the Admin's assignments.
-                    admin_client.table("profiles").update({
-                        "full_name": full_name,
-                        "username": new_username,
-                        "role": ROLES[selected_role_label],
-                        "department": department,
-                        "is_active": True,
-                    }).eq("id", created_user_id).execute()
-
-                    st.success(
-                        f"Account created for {full_name}. "
-                        f"Username: {new_username}"
-                    )
-
-                    st.info(
-                        "Share the username and initial password "
-                        "with the employee securely. The password "
-                        "is not stored in the CRM profile."
-                    )
-
-                    st.rerun()
+                            st.success(
+                                f"Created account for {full_name}. "
+                                f"Username: {new_username}"
+                            )
+                            st.info(
+                                "Share the initial password securely "
+                                "with the employee."
+                            )
+                            st.rerun()
 
                 except PermissionError:
-                    st.error(
-                        "Permission denied. Only an active Admin "
-                        "can create accounts."
-                    )
-
+                    st.error("Only an active Admin can create users.")
                 except Exception:
-                    # Roll back the Auth account if profile setup fails.
-                    # This avoids leaving a user who cannot sign in
-                    # using the CRM username.
                     if created_user_id:
                         try:
                             require_active_admin()
@@ -507,19 +403,11 @@ if role == "admin":
                             pass
 
                     st.error(
-                        "Account creation failed. Check the username, "
-                        "database trigger, and Supabase Auth settings. "
-                        "If the problem persists, inspect the server "
-                        "logs without sharing passwords or secret keys."
+                        "Account creation failed. Check Supabase Auth, "
+                        "the profile trigger, and database settings."
                     )
 
-    # --------------------------------------------------
-    # EXISTING USERS
-    # --------------------------------------------------
     st.markdown("#### Existing Employees")
-
-    if st.button("Refresh User List"):
-        st.rerun()
 
     try:
         require_active_admin()
@@ -528,7 +416,8 @@ if role == "admin":
         users_result = (
             admin_client.table("profiles")
             .select(
-                "full_name, username, role, department, is_active, created_at"
+                "full_name, username, role, department, "
+                "is_active, created_at"
             )
             .order("full_name")
             .limit(500)
@@ -541,18 +430,18 @@ if role == "admin":
             st.dataframe(
                 [
                     {
-                        "Employee": item.get("full_name") or "-",
-                        "Username": item.get("username") or "-",
+                        "Employee": u.get("full_name") or "-",
+                        "Username": u.get("username") or "-",
                         "Role": (
-                            item.get("role") or "-"
+                            u.get("role") or "-"
                         ).replace("_", " ").title(),
-                        "Department": item.get("department") or "-",
+                        "Department": u.get("department") or "-",
                         "Active": (
-                            "Yes" if item.get("is_active") else "No"
+                            "Yes" if u.get("is_active") else "No"
                         ),
-                        "Created": item.get("created_at") or "-",
+                        "Created": u.get("created_at") or "-",
                     }
-                    for item in users
+                    for u in users
                 ],
                 use_container_width=True,
                 hide_index=True,
@@ -573,7 +462,6 @@ st.subheader("➕ Create New Sale")
 with st.form("new_sale_form", clear_on_submit=True):
     customer_name = st.text_input("Customer Name *")
     customer_phone = st.text_input("Customer Phone Number")
-
     create_sale = st.form_submit_button(
         "Create Sale",
         use_container_width=True,
@@ -582,10 +470,8 @@ with st.form("new_sale_form", clear_on_submit=True):
 if create_sale:
     if not customer_name.strip():
         st.warning("Customer Name is required.")
-
     else:
         try:
-            # Sales operations always use the authenticated client.
             sale_result = (
                 supabase.table("sales")
                 .insert({
@@ -616,27 +502,24 @@ if create_sale:
                         f"Sale created successfully. "
                         f"Reference: {sale['id']}"
                     )
-
                 except Exception:
                     st.warning(
                         "The sale was created, but its history entry "
-                        "could not be saved. Please contact the administrator."
+                        "could not be saved."
                     )
 
                 st.rerun()
-
             else:
                 st.error("The sale could not be created.")
 
         except Exception:
             st.error(
-                "Unable to create the sale. Check your database "
-                "permissions or contact the administrator."
+                "Unable to create the sale. Check database permissions."
             )
 
 
 # --------------------------------------------------
-# SALES LIST
+# SALES RECORDS AND QUALITY REVIEW
 # --------------------------------------------------
 st.divider()
 st.subheader("📋 Sales Records")
@@ -646,19 +529,14 @@ try:
         supabase.table("sales")
         .select(
             "id, customer_name, customer_phone, "
-            "assigned_department, current_stage, status, created_at"
+            "created_by, assigned_department, current_stage, "
+            "status, rejection_reason, created_at"
         )
         .order("created_at", desc=True)
     )
 
-    # Preserve the existing initial visibility rules.
-    # Database RLS must also enforce access.
-# Agents see their own sales.
-# Department Staff see sales assigned to their department.
-# Managers and Admins can see organisation-wide sales.
     if role == "agent":
         query = query.eq("created_by", user_id)
-    
     elif role == "department_staff":
         query = query.eq(
             "assigned_department",
@@ -668,31 +546,116 @@ try:
     result = query.limit(200).execute()
     sales = result.data or []
 
-    if sales:
-        for sale in sales:
-            with st.expander(
-                f"{sale['customer_name']} — {sale['current_stage']}"
-            ):
-                st.write(f"**Reference:** {sale['id']}")
-                st.write(
-                    f"**Phone:** {sale.get('customer_phone') or '-'}"
-                )
-                st.write(
-                    f"**Department:** {sale['assigned_department']}"
-                )
-                st.write(f"**Stage:** {sale['current_stage']}")
-                st.write(f"**Status:** {sale['status']}")
-                st.write(f"**Created:** {sale['created_at']}")
-
-    else:
+    if not sales:
         st.info("No sales records are available to display.")
+
+    for sale in sales:
+        sale_id = sale["id"]
+        is_quality_review = (
+            sale["current_stage"] == "Quality"
+            and sale["assigned_department"] == "Quality"
+            and sale["status"] == "Pending"
+        )
+
+        with st.expander(
+            f"{sale['customer_name']} — "
+            f"{sale['current_stage']} — {sale['status']}"
+        ):
+            st.write(f"**Reference:** {sale_id}")
+            st.write(
+                f"**Phone:** {sale.get('customer_phone') or '-'}"
+            )
+            st.write(
+                f"**Department:** {sale['assigned_department']}"
+            )
+            st.write(f"**Stage:** {sale['current_stage']}")
+            st.write(f"**Status:** {sale['status']}")
+            st.write(
+                f"**Created:** {sale.get('created_at') or '-'}"
+            )
+
+            if sale.get("rejection_reason"):
+                st.error(
+                    f"**Rejection reason:** "
+                    f"{sale['rejection_reason']}"
+                )
+
+            # Review controls are displayed only for eligible users.
+            if (
+                role == "admin"
+                or (
+                    role == "department_staff"
+                    and profile["department"] == "Quality"
+                )
+            ) and is_quality_review:
+                st.divider()
+                st.markdown("#### Quality Review")
+
+                decision_key = f"quality_decision_{sale_id}"
+                remarks_key = f"quality_remarks_{sale_id}"
+
+                decision = st.radio(
+                    "Decision",
+                    ["Approve", "Reject"],
+                    horizontal=True,
+                    key=decision_key,
+                )
+
+                remarks = st.text_area(
+                    "Remarks" if decision == "Approve"
+                    else "Rejection Reason *",
+                    key=remarks_key,
+                    placeholder=(
+                        "Enter review remarks..."
+                        if decision == "Approve"
+                        else "Explain why this application is rejected..."
+                    ),
+                )
+
+                if st.button(
+                    "Submit Quality Decision",
+                    key=f"quality_submit_{sale_id}",
+                    use_container_width=True,
+                ):
+                    if decision == "Reject" and not remarks.strip():
+                        st.warning(
+                            "A rejection reason is required."
+                        )
+                    else:
+                        try:
+                            # The database function validates the
+                            # user's permissions and current sale state.
+                            response = supabase.rpc(
+                                "review_sale_quality",
+                                {
+                                    "p_sale_id": sale_id,
+                                    "p_decision": (
+                                        "Approved"
+                                        if decision == "Approve"
+                                        else "Rejected"
+                                    ),
+                                    "p_remarks": remarks.strip() or None,
+                                },
+                            ).execute()
+
+                            st.success(
+                                f"Quality decision submitted: {decision}."
+                            )
+                            st.rerun()
+
+                        except Exception:
+                            st.error(
+                                "The Quality decision could not be "
+                                "saved. The sale may have already been "
+                                "reviewed, or your permissions may "
+                                "have changed. Refresh and try again."
+                            )
 
 except Exception:
     st.error(
-        "Unable to load sales records. Please check the database "
-        "access policies."
+        "Unable to load sales records. Check the database access policies."
     )
 
 
 st.divider()
-st.caption("Sales CRM | Username authentication and sales entry")
+st.caption("Sales CRM | Quality Review workflow")
