@@ -653,8 +653,17 @@ try:
 
     # Preserve the existing initial visibility rules.
     # Database RLS must also enforce access.
-    if role in ("agent", "department_staff"):
+# Agents see their own sales.
+# Department Staff see sales assigned to their department.
+# Managers and Admins can see organisation-wide sales.
+    if role == "agent":
         query = query.eq("created_by", user_id)
+    
+    elif role == "department_staff":
+        query = query.eq(
+            "assigned_department",
+            profile["department"],
+        )
 
     result = query.limit(200).execute()
     sales = result.data or []
