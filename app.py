@@ -255,7 +255,6 @@ NAVIGATION = [
     "Overview",
     "Sales Records",
     "New Sale",
-    "Cancellation Register",
 ]
 
 
@@ -621,8 +620,10 @@ is_live_auth_user = is_live_authorisation_employee(profile)
 # =========================================================
 # SIDEBAR NAVIGATION
 # =========================================================
-nav_options = NAVIGATION + (["User Management"] if role == "admin" else [])
+nav_options = NAVIGATION + (["Cancellation Register", "User Management"] if role == "admin" else [])
 if st.session_state.get("crm_navigation") not in nav_options:
+    st.session_state["crm_navigation"] = "Overview"
+if role != "admin" and st.session_state.get("crm_navigation") == "Cancellation Register":
     st.session_state["crm_navigation"] = "Overview"
 with st.sidebar:
     st.markdown(
@@ -641,6 +642,9 @@ with st.sidebar:
         key="crm_navigation",
         label_visibility="collapsed",
     )
+    if selected_page == "Cancellation Register" and role != "admin":
+        selected_page = "Overview"
+        st.session_state["crm_navigation"] = "Overview"
     st.divider()
     st.markdown('<div class="crm-nav-label">SIGNED-IN USER</div>', unsafe_allow_html=True)
     st.markdown(
@@ -773,13 +777,14 @@ if selected_page == "Overview":
             else:
                 st.markdown('<div class="crm-empty"><div class="crm-empty-title">Nothing to review</div>Create a new sale or check back when applications are assigned.</div>', unsafe_allow_html=True)
         st.write("")
-        quick_cols = st.columns(3)
+        quick_cols = st.columns(3 if role == "admin" else 2)
         with quick_cols[0]:
             st.markdown('<div class="crm-panel"><b>Sales records</b><br><span style="color:#68788e;font-size:.85rem">Search and review applications and their history.</span></div>', unsafe_allow_html=True)
         with quick_cols[1]:
             st.markdown('<div class="crm-panel"><b>New application</b><br><span style="color:#68788e;font-size:.85rem">Capture the customer and sales details.</span></div>', unsafe_allow_html=True)
-        with quick_cols[2]:
-            st.markdown('<div class="crm-panel"><b>Cancellation register</b><br><span style="color:#68788e;font-size:.85rem">Audit closed and cancelled records.</span></div>', unsafe_allow_html=True)
+        if role == "admin":
+            with quick_cols[2]:
+                st.markdown('<div class="crm-panel"><b>Cancellation register</b><br><span style="color:#68788e;font-size:.85rem">Audit closed and cancelled records.</span></div>', unsafe_allow_html=True)
 
 
 # =========================================================
@@ -1031,86 +1036,90 @@ if selected_page == "Sales Records":
             is_quality_review = stage == "Quality" and assigned_department == "Quality" and status == "Pending"
             is_live_authorisation_record = stage == "Live" and assigned_department == LIVE_AUTH_DEPARTMENT and status == "Pending"
 
-            with st.expander(f"{customer}   ·   {stage}   ·   {status}", expanded=False):
+            with st.expander(f"{customer}   ·   {status}", expanded=False):
                 show_status_chips(stage, status, assigned_department)
                 if role == "admin":
-                    detail_tabs = st.tabs(["Overview", "Workflow & comments", "Cancellation override", "History"])
-                    overview_tab, workflow_tab, admin_tab, history_tab = detail_tabs
+                    overview_tab, admin_tab, history_tab = st.tabs([
+                        "Overview & workflow", "Cancellation override", "History"
+                    ])
                 else:
-                    detail_tabs = st.tabs(["Overview", "Workflow & comments", "History"])
-                    overview_tab, workflow_tab, history_tab = detail_tabs
+                    overview_tab, history_tab = st.tabs(["Overview & workflow", "History"])
                     admin_tab = None
 
                 # -----------------------------------------
-                # OVERVIEW TAB
+                # COMPACT OVERVIEW + WORKFLOW
                 # -----------------------------------------
                 with overview_tab:
                     if is_terminal and status == "Cancelled":
-                        st.error("This sale has been cancelled.")
-                        st.write(f"**Cancellation reason:** {sale.get('cancellation_reason') or sale.get('rejection_reason') or '-'}")
-                        st.write(f"**Cancellation date:** {sale.get('cancellation_date') or '-'}")
+                        st.error(
+                            "Cancelled · "
+                            f"{sale.get('cancellation_reason') or sale.get('rejection_reason') or 'No reason recorded'}"
+                        )
+                        st.caption(f"Cancellation date: {sale.get('cancellation_date') or '—'}")
                     elif status == "Rejected" and sale.get("rejection_reason"):
-                        st.error(f"Rejection reason: {sale['rejection_reason']}")
+                        st.error(f"Rejected · {sale['rejection_reason']}")
                     elif status == "Live":
-                        st.success(f"Sale authorised as Live on {sale.get('live_date') or 'date not recorded'}.")
+                        st.success(f"Authorised as Live · {sale.get('live_date') or 'date not recorded'}")
 
-                    info_cols = st.columns(3)
+                    info_cols = st.columns([1.25, 1.25, 1.5])
                     with info_cols[0]:
                         st.caption("CUSTOMER")
-                        st.markdown(f"**{customer}**")
-                        st.write(sale.get("customer_phone") or "No phone number")
+                        st.markdown(f"**{escape(customer)}**")
+                        st.caption(sale.get("customer_phone") or "No phone number")
                     with info_cols[1]:
-                        st.caption("WORKFLOW")
-                        st.markdown(f"**{stage}**")
-                        st.write(f"Assigned to {assigned_department}")
+                        st.caption("CURRENT WORKFLOW")
+                        st.markdown(f"**{escape(stage)}**")
+                        st.caption(f"Assigned to {escape(assigned_department)}")
                     with info_cols[2]:
-                        st.caption("RECORD")
-                        st.markdown(f"**Created**")
-                        st.write(sale.get("created_at") or "-")
-                        st.caption("Reference")
-                        st.code(sale_id, language=None)
+                        st.caption("REFERENCE / UPDATED")
+                        st.markdown(
+                            f'<div style="font-size:.76rem;line-height:1.45;overflow-wrap:anywhere">{escape(sale_id)}</div>',
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(f"{sale.get('updated_at') or sale.get('created_at') or '—'}")
 
-                    st.divider()
-                    st.markdown("#### Customer and sales details")
-                    customer_fields = [
-                        ("Address", "address"),
-                        ("Post code", "post_code"),
-                        ("Sort code", "sort_code"),
-                        ("Account number", "account_number"),
-                        ("Bank name", "bank_name"),
-                        ("Package offered", "package_offered"),
-                        ("Contract duration", "contract_duration"),
-                    ]
-                    field_cols = st.columns(2)
-                    for index, (label, field_name) in enumerate(customer_fields):
-                        value = sale.get(field_name)
-                        with field_cols[index % 2]:
-                            st.caption(label)
-                            st.write(value if value not in (None, "") else "—")
+                    # Long, mostly reference-only fields remain available without
+                    # taking over the accordion every time it is opened.
+                    with st.expander("View full customer, banking and workflow details", expanded=False):
+                        st.markdown("**Customer & sales details**")
+                        customer_fields = [
+                            ("Address", "address"),
+                            ("Post code", "post_code"),
+                            ("Sort code", "sort_code"),
+                            ("Account number", "account_number"),
+                            ("Bank name", "bank_name"),
+                            ("Package offered", "package_offered"),
+                            ("Contract duration", "contract_duration"),
+                        ]
+                        detail_cols = st.columns(3)
+                        for index, (label, field_name) in enumerate(customer_fields):
+                            value = sale.get(field_name)
+                            with detail_cols[index % 3]:
+                                st.caption(label)
+                                st.write(value if value not in (None, "") else "—")
 
-                    st.divider()
-                    st.markdown("#### Workflow details")
-                    stage_fields = [
-                        ("DD reference number", "dd_reference_number"),
-                        ("Payment date", "payment_date"),
-                        ("Letter sent date", "letter_sent_date"),
-                        ("Committed call", "committed_call"),
-                        ("Committed call comments", "committed_call_comments"),
-                        ("Provisioning date", "provisioning_date"),
-                        ("SIM number", "sim_number"),
-                        ("Live date", "live_date"),
-                    ]
-                    field_cols = st.columns(2)
-                    for index, (label, field_name) in enumerate(stage_fields):
-                        value = sale.get(field_name)
-                        with field_cols[index % 2]:
-                            st.caption(label)
-                            st.write(value if value not in (None, "") else "—")
+                        st.divider()
+                        st.markdown("**Workflow milestones**")
+                        stage_fields = [
+                            ("DD reference number", "dd_reference_number"),
+                            ("Payment date", "payment_date"),
+                            ("Letter sent date", "letter_sent_date"),
+                            ("Committed call", "committed_call"),
+                            ("Committed call comments", "committed_call_comments"),
+                            ("Provisioning date", "provisioning_date"),
+                            ("SIM number", "sim_number"),
+                            ("Live date", "live_date"),
+                        ]
+                        milestone_cols = st.columns(3)
+                        for index, (label, field_name) in enumerate(stage_fields):
+                            value = sale.get(field_name)
+                            with milestone_cols[index % 3]:
+                                st.caption(label)
+                                st.write(value if value not in (None, "") else "—")
 
-                # -----------------------------------------
-                # WORKFLOW / COMMENTS TAB
-                # -----------------------------------------
-                with workflow_tab:
+                    if not is_terminal:
+                        st.markdown("#### Workflow actions")
+
                     if is_terminal:
                         st.markdown('<div class="crm-soft-note">This record is closed. Standard workflow actions and comments are disabled for terminal statuses.</div>', unsafe_allow_html=True)
                     else:
@@ -1255,22 +1264,22 @@ if selected_page == "Sales Records":
                             elif stage == "Quality" and status == "Pending" and role not in ("admin", "manager") and user_department != "Quality":
                                 st.caption("This application is awaiting Quality review.")
 
-                            # Regular comments remain available only for non-terminal records and users allowed to process the sale.
-                            st.divider()
-                            st.markdown("#### Add a comment")
-                            comment = st.text_area("Comment", key=f"comment_text_{sale_id}", placeholder="Add a stage comment or update…")
-                            if st.button("Save comment", key=f"comment_submit_{sale_id}", width="stretch"):
-                                if not comment.strip():
-                                    st.warning("Enter a comment before saving.")
-                                else:
-                                    try:
-                                        call_workflow(sale_id, "Add Comment", comment)
-                                        st.success("Comment saved to application history.")
-                                        st.rerun()
-                                    except Exception as exc:
-                                        st.error(f"The comment could not be saved. Details: {exc}")
+                            # General comments are optional so they do not dominate the application view.
+                            with st.expander("＋ Add a comment", expanded=False):
+                                comment = st.text_area("Comment", key=f"comment_text_{sale_id}", placeholder="Add a stage comment or update…")
+                                if st.button("Save comment", key=f"comment_submit_{sale_id}", width="stretch"):
+                                    if not comment.strip():
+                                        st.warning("Enter a comment before saving.")
+                                    else:
+                                        try:
+                                            call_workflow(sale_id, "Add Comment", comment)
+                                            st.success("Comment saved to application history.")
+                                            st.rerun()
+                                        except Exception as exc:
+                                            st.error(f"The comment could not be saved. Details: {exc}")
                         else:
                             st.info("This record is visible to you, but processing is restricted to its assigned department.")
+
 
                 # -----------------------------------------
                 # ADMIN CANCELLATION OVERRIDE TAB
@@ -1342,7 +1351,7 @@ if selected_page == "Sales Records":
 # =========================================================
 # CANCELLATION REGISTER
 # =========================================================
-if selected_page == "Cancellation Register":
+if selected_page == "Cancellation Register" and role == "admin":
     section_heading("Cancellation register", "A read-only audit view of cancelled applications across departments.", "AUDIT & OVERSIGHT")
     st.markdown('<div class="crm-soft-note">This register is for visibility and audit. Cancelled applications cannot be processed further through the normal workflow.</div>', unsafe_allow_html=True)
     st.write("")
