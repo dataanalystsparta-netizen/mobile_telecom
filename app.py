@@ -203,6 +203,26 @@ def apply_crm_theme() -> None:
         }
         .crm-empty-title { color: var(--crm-ink); font-size: 1rem; font-weight: 760; margin-bottom: .25rem; }
         .crm-footer { border-top: 1px solid var(--crm-border); margin-top: 2rem; padding-top: .9rem; color: #8390a2; font-size: .73rem; }
+        .crm-stage-kpi-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .8rem; margin: .25rem 0 1.25rem; }
+        .crm-stage-kpi { min-width: 0; background: #fff; border: 1px solid var(--crm-border); border-radius: 14px; padding: .9rem 1rem; box-shadow: 0 3px 12px rgba(25,47,82,.025); }
+        .crm-stage-kpi-title { color: var(--crm-ink); font-size: .91rem; font-weight: 790; letter-spacing: -.02em; line-height: 1.3; }
+        .crm-stage-kpi-total { color: var(--crm-muted); font-size: .7rem; margin-top: .16rem; }
+        .crm-stage-kpi-pills { display: flex; flex-wrap: wrap; gap: .32rem; margin-top: .72rem; }
+        .crm-kpi-pill { display: inline-flex; align-items: center; gap: .28rem; border-radius: 999px; padding: .27rem .46rem; font-size: .67rem; line-height: 1.25; font-weight: 720; border: 1px solid transparent; white-space: nowrap; }
+        .crm-stage-table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--crm-border); border-radius: 13px; background: #fff; box-shadow: 0 3px 12px rgba(25,47,82,.025); }
+        table.crm-stage-table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font-size: .77rem; color: var(--crm-ink); }
+        .crm-stage-table th, .crm-stage-table td { padding: .58rem .68rem; border-right: 1px solid #e8edf5; border-bottom: 1px solid #e8edf5; text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
+        .crm-stage-table thead tr:first-child th { position: sticky; top: 0; z-index: 2; color: #fff; background: #192d46; font-size: .72rem; font-weight: 800; letter-spacing: .02em; }
+        .crm-stage-table thead tr:nth-child(2) th { position: sticky; top: 35px; z-index: 2; color: #506078; background: #f0f4fb; font-size: .69rem; font-weight: 780; }
+        .crm-stage-table th.crm-date-head { min-width: 116px; }
+        .crm-stage-table tbody tr:nth-child(even) { background: #f9fbfe; }
+        .crm-stage-table tbody tr:hover { background: #eef4ff; }
+        .crm-stage-table td.crm-date-cell { text-align: left; font-weight: 760; color: #334968; background: #f7f9fd; }
+        .crm-stage-table td.crm-count-zero { color: #a1adbd; }
+        .crm-stage-table th:last-child, .crm-stage-table td:last-child { border-right: 0; }
+        .crm-stage-table tbody tr:last-child td { border-bottom: 0; }
+        @media (max-width: 1050px) { .crm-stage-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+        @media (max-width: 600px) { .crm-stage-kpi-grid { grid-template-columns: 1fr; } }
         @media (max-width: 800px) {
             .crm-page-header { align-items: flex-start; flex-direction: column; padding: 1.1rem; }
             .main .block-container { padding-top: 1rem; }
@@ -564,48 +584,162 @@ def load_history_for_sales(sale_ids):
     return all_rows
 
 
-def build_stage_breakdown(stage_sales, history_rows):
-    """Count current queue and completed historical milestones by stage/status."""
-    stage_names = [
-        "Quality",
-        "DD Setup",
-        "Letter Sending",
-        "Confirmation Call",
-        "SIM + Hardware Provisioning",
-        "Live Authorisation",
-    ]
-    buckets = {
-        stage: {key: set() for key in ("Pending", "Approved / Done", "Rejected", "Cancelled", "Live")}
-        for stage in stage_names
-    }
-    sale_by_id = {str(s.get("id")): s for s in stage_sales if s.get("id")}
+STAGE_STATUS_COLUMNS = {
+    "Quality": [
+        ("Approved", "Approved"),
+        ("Rejected", "Rejected"),
+        ("Pending", "Pending"),
+        ("Cancelled", "Cancelled"),
+    ],
+    "DD Setup": [
+        ("Complete", "Complete"),
+        ("Pending", "Pending"),
+        ("Cancelled", "Cancelled"),
+    ],
+    "Letter Sending": [
+        ("Complete", "Complete"),
+        ("Pending", "Pending"),
+        ("Cancelled", "Cancelled"),
+    ],
+    "Confirmation Call": [
+        ("Committed", "Committed"),
+        ("Not Committed", "Not Committed"),
+        ("Callback Requested", "Callback Requested"),
+        ("No Answer", "No Answer"),
+        ("Other", "Other"),
+        ("Pending", "Pending"),
+        ("Cancelled", "Cancelled"),
+    ],
+    "SIM + Hardware Provisioning": [
+        ("Complete", "Complete"),
+        ("Pending", "Pending"),
+        ("Cancelled", "Cancelled"),
+    ],
+    "Live Authorisation": [
+        ("Live", "Live"),
+        ("Pending", "Pending"),
+        ("Cancelled", "Cancelled"),
+    ],
+}
 
-    # Current records represent the application's present state.
+ALL_STAGE_NAMES = list(STAGE_STATUS_COLUMNS.keys())
+DEPARTMENT_TO_STAGE = {
+    "Quality": "Quality",
+    "DD Setup": "DD Setup",
+    "Letter Sending": "Letter Sending",
+    "Confirmation Call": "Confirmation Call",
+    "SIM + Hardware Provisioning": "SIM + Hardware Provisioning",
+    LIVE_AUTH_DEPARTMENT: "Live Authorisation",
+}
+
+
+def relevant_stage_names(profile):
+    """Return dashboard stages appropriate to the signed-in role and scope."""
+    role = profile.get("role")
+    if role in ("admin", "manager", "agent"):
+        # Admins/managers see the whole operation; agents see the full path for
+        # their own applications, which are already filtered by created_by.
+        return ALL_STAGE_NAMES.copy()
+    if role == "department_staff":
+        own_stage = DEPARTMENT_TO_STAGE.get(profile.get("department"))
+        # Do not expose unrelated stage aggregates to staff assigned to a
+        # department that is not part of the sale workflow.
+        return [own_stage] if own_stage else []
+    return ALL_STAGE_NAMES.copy()
+
+
+def build_stage_breakdown_by_date(stage_sales, history_rows):
+    """Return date -> stage -> status -> set(sale IDs), avoiding duplicate counts.
+
+    The row date is the application's recorded creation/sale date. A sale can
+    count in a completed status for an earlier stage and in the current queue
+    for its current stage. History milestones are restricted to the application
+    IDs already visible to the current user.
+    """
+    sale_by_id = {str(item.get("id")): item for item in stage_sales if item.get("id")}
+    counts = {}
+
+    def ensure_day(day):
+        if day not in counts:
+            counts[day] = {
+                stage: {key: set() for key, _label in columns}
+                for stage, columns in STAGE_STATUS_COLUMNS.items()
+            }
+
+    def add(sale_id, stage, status_key):
+        sale_id = str(sale_id or "")
+        sale = sale_by_id.get(sale_id)
+        if not sale or stage not in STAGE_STATUS_COLUMNS:
+            return
+        valid_keys = {key for key, _label in STAGE_STATUS_COLUMNS[stage]}
+        if status_key not in valid_keys:
+            return
+        day = sale_created_date(sale)
+        if not day:
+            return
+        ensure_day(day)
+        counts[day][stage][status_key].add(sale_id)
+
+    # Keep dates represented even when the current status does not map to a
+    # workflow bucket (so every application date remains visible in the table).
     for sale_id, sale in sale_by_id.items():
-        stage = sale.get("current_stage")
-        status = sale.get("status")
-        if status == "Rejected":
-            buckets["Quality"]["Rejected"].add(sale_id)
-        elif status == "Cancelled":
-            row_stage = "Live Authorisation" if stage == "Live" else stage
-            if row_stage in buckets:
-                buckets[row_stage]["Cancelled"].add(sale_id)
-        elif status == "Live":
-            buckets["Live Authorisation"]["Live"].add(sale_id)
-        elif stage == "Quality" and status == "Pending":
-            buckets["Quality"]["Pending"].add(sale_id)
-        elif stage == "DD Setup" and status == "Pending":
-            buckets["DD Setup"]["Pending"].add(sale_id)
-        elif stage == "Letter Sending" and status == "Pending":
-            buckets["Letter Sending"]["Pending"].add(sale_id)
-        elif stage == "Confirmation Call" and status == "Pending":
-            buckets["Confirmation Call"]["Pending"].add(sale_id)
-        elif stage == "SIM + Hardware Provisioning" and status in ("Approved", "Pending"):
-            buckets["SIM + Hardware Provisioning"]["Pending"].add(sale_id)
-        elif stage == "Live" and status == "Pending":
-            buckets["Live Authorisation"]["Pending"].add(sale_id)
+        day = sale_created_date(sale)
+        if day:
+            ensure_day(day)
 
-    # Stage completions remain visible after the application moves to a later stage.
+        stage = str(sale.get("current_stage") or "").strip()
+        status = str(sale.get("status") or "").strip()
+        assigned_department = str(sale.get("assigned_department") or "").strip()
+        outcome = str(sale.get("committed_call") or "").strip()
+
+        # Current terminal states and queues.
+        if status == "Rejected":
+            add(sale_id, "Quality", "Rejected")
+        elif status == "Cancelled":
+            if stage == "Live" or assigned_department == LIVE_AUTH_DEPARTMENT:
+                cancel_stage = "Live Authorisation"
+            else:
+                cancel_stage = stage if stage in STAGE_STATUS_COLUMNS else None
+            if cancel_stage:
+                add(sale_id, cancel_stage, "Cancelled")
+        elif status == "Live":
+            add(sale_id, "Live Authorisation", "Live")
+        else:
+            if stage == "Quality":
+                if status == "Pending":
+                    add(sale_id, "Quality", "Pending")
+                elif status in ("Approved", "Done", "Complete"):
+                    add(sale_id, "Quality", "Approved")
+            elif stage == "DD Setup":
+                if status == "Pending":
+                    add(sale_id, "DD Setup", "Pending")
+                elif status in ("Approved", "Done", "Complete"):
+                    add(sale_id, "DD Setup", "Complete")
+            elif stage == "Letter Sending":
+                if status == "Pending":
+                    add(sale_id, "Letter Sending", "Pending")
+                elif status in ("Approved", "Done", "Complete"):
+                    add(sale_id, "Letter Sending", "Complete")
+            elif stage == "Confirmation Call":
+                if outcome in {key for key, _label in STAGE_STATUS_COLUMNS["Confirmation Call"]} and outcome != "Cancelled":
+                    add(sale_id, "Confirmation Call", outcome)
+                elif status == "Pending":
+                    add(sale_id, "Confirmation Call", "Pending")
+            elif stage == "SIM + Hardware Provisioning":
+                if status in ("Approved", "Pending"):
+                    add(sale_id, "SIM + Hardware Provisioning", "Pending")
+                elif status in ("Done", "Complete"):
+                    add(sale_id, "SIM + Hardware Provisioning", "Complete")
+            elif stage == "Live" and status == "Pending":
+                if assigned_department == LIVE_AUTH_DEPARTMENT:
+                    add(sale_id, "Live Authorisation", "Pending")
+
+        # The call outcome is a milestone field and remains useful after the
+        # sale advances beyond Confirmation Call.
+        if outcome in {key for key, _label in STAGE_STATUS_COLUMNS["Confirmation Call"]}:
+            add(sale_id, "Confirmation Call", outcome)
+
+    # Count completed stage transitions by the application creation date.
     for event in history_rows:
         sale_id = str(event.get("sale_id") or "")
         if sale_id not in sale_by_id:
@@ -614,31 +748,179 @@ def build_stage_breakdown(stage_sales, history_rows):
         previous = str(event.get("previous_stage") or "").strip()
         new_stage = str(event.get("new_stage") or "").strip()
 
-        if previous == "Quality" and ("approv" in action or new_stage == "DD Setup"):
-            buckets["Quality"]["Approved / Done"].add(sale_id)
-        if previous == "Quality" and ("reject" in action or new_stage == "Rejected"):
-            buckets["Quality"]["Rejected"].add(sale_id)
-        if (previous == "DD Setup" and new_stage == "Letter Sending") or "complete dd setup" in action:
-            buckets["DD Setup"]["Approved / Done"].add(sale_id)
-        if (previous == "Letter Sending" and new_stage == "Confirmation Call") or action == "letter sent":
-            buckets["Letter Sending"]["Approved / Done"].add(sale_id)
-        if previous == "Confirmation Call" and new_stage == "SIM + Hardware Provisioning":
-            buckets["Confirmation Call"]["Approved / Done"].add(sale_id)
-        if "approved" in action and previous == "Confirmation Call":
-            buckets["Confirmation Call"]["Approved / Done"].add(sale_id)
-        if (previous == "SIM + Hardware Provisioning" and new_stage == "Live") or "complete provisioning" in action:
-            buckets["SIM + Hardware Provisioning"]["Approved / Done"].add(sale_id)
+        if previous == "Quality":
+            if "reject" in action or new_stage.lower() == "rejected":
+                add(sale_id, "Quality", "Rejected")
+            elif "approv" in action or new_stage == "DD Setup":
+                add(sale_id, "Quality", "Approved")
 
-    rows = []
+        if (
+            (previous == "DD Setup" and new_stage == "Letter Sending")
+            or "complete dd setup" in action
+        ):
+            add(sale_id, "DD Setup", "Complete")
+
+        if (
+            (previous == "Letter Sending" and new_stage == "Confirmation Call")
+            or action == "letter sent"
+            or "letter sent" in action
+        ):
+            add(sale_id, "Letter Sending", "Complete")
+
+        if previous == "Confirmation Call" and new_stage == "SIM + Hardware Provisioning":
+            outcome = str(sale_by_id[sale_id].get("committed_call") or "").strip()
+            if outcome in {key for key, _label in STAGE_STATUS_COLUMNS["Confirmation Call"]}:
+                add(sale_id, "Confirmation Call", outcome)
+            else:
+                # A successful transition out of the call stage historically
+                # implies a committed call even if the legacy field is blank.
+                add(sale_id, "Confirmation Call", "Committed")
+
+        if (
+            (
+                previous == "SIM + Hardware Provisioning"
+                and new_stage in ("Live", "Live Authorisation", LIVE_AUTH_DEPARTMENT)
+            )
+            or "complete provisioning" in action
+        ):
+            add(sale_id, "SIM + Hardware Provisioning", "Complete")
+
+    return counts
+
+
+def load_stage_breakdown_from_rpc(start_date, end_date, base_sales):
+    """Load secure, role-scoped historical stage counts from Supabase.
+
+    The RPC returns aggregate counts only (no customer details). This lets a
+    department's stage totals include completed applications that have already
+    moved to another department, without exposing those sales records.
+    """
+    response = supabase.rpc(
+        "get_stage_status_breakdown",
+        {
+            "p_start_date": start_date.isoformat(),
+            "p_end_date": end_date.isoformat(),
+        },
+    ).execute()
+
+    counts = {}
+
+    def ensure_day(day):
+        if day not in counts:
+            counts[day] = {
+                stage: {key: 0 for key, _label in columns}
+                for stage, columns in STAGE_STATUS_COLUMNS.items()
+            }
+
+    # Keep dates visible for applications already returned to this user. The
+    # RPC may add older dates for stage milestones that have since moved on.
+    for sale in base_sales:
+        day = sale_created_date(sale)
+        if day:
+            ensure_day(day)
+
+    for row in response.data or []:
+        day = parse_db_date(row.get("sale_date"))
+        stage = str(row.get("stage") or "")
+        status_key = str(row.get("status_key") or "")
+        if not day or stage not in STAGE_STATUS_COLUMNS:
+            continue
+        valid_keys = {key for key, _label in STAGE_STATUS_COLUMNS[stage]}
+        if status_key not in valid_keys:
+            continue
+        ensure_day(day)
+        counts[day][stage][status_key] = int(row.get("application_count") or 0)
+
+    return counts
+
+
+def _status_count(value):
+    """Support local sets and integer aggregates returned by the secure RPC."""
+    if isinstance(value, (set, list, tuple)):
+        return len(value)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def aggregate_stage_counts(counts_by_date):
+    """Sum daily stage/status counts for the date-filter-aware KPI cards."""
+    aggregate = {
+        stage: {key: 0 for key, _label in columns}
+        for stage, columns in STAGE_STATUS_COLUMNS.items()
+    }
+    for per_day in counts_by_date.values():
+        for stage, per_status in per_day.items():
+            for status_key, values in per_status.items():
+                aggregate[stage][status_key] += _status_count(values)
+    return aggregate
+
+
+def render_stage_kpi_cards(aggregate_counts, stage_names):
+    """Render one compact KPI card per stage, with every stage status listed."""
+    if not stage_names:
+        st.info("No stage summaries are configured for this role.")
+        return
+
+    cards_html = ['<div class="crm-stage-kpi-grid">']
     for stage in stage_names:
-        values = buckets[stage]
-        # A sale may count in multiple stages over its life; each row is a stage-specific audit.
-        row = {"Stage": stage}
-        for key in ("Pending", "Approved / Done", "Rejected", "Cancelled", "Live"):
-            row[key] = len(values[key])
-        row["Total in stage"] = len(set().union(*values.values()))
-        rows.append(row)
-    return rows
+        values = aggregate_counts.get(stage, {})
+        pills = []
+        for status_key, label in STAGE_STATUS_COLUMNS[stage]:
+            amount = _status_count(values.get(status_key, 0))
+            chip_class = status_chip_class(label)
+            pills.append(
+                f'<span class="crm-kpi-pill {chip_class}">'
+                f'<span>{escape(label)}</span><b>{amount:,}</b></span>'
+            )
+        cards_html.append(
+            '<div class="crm-stage-kpi">'
+            f'<div class="crm-stage-kpi-title">{escape(stage)}</div>'
+            f'<div class="crm-stage-kpi-pills">{"".join(pills)}</div>'
+            '</div>'
+        )
+    cards_html.append('</div>')
+    st.markdown("".join(cards_html), unsafe_allow_html=True)
+
+
+def render_stage_breakdown_table(counts_by_date, stage_names):
+    """Render a grouped HTML table: date rows and two-level stage/status headers."""
+    if not stage_names:
+        st.info("No workflow-stage breakdown is configured for this department.")
+        return
+    if not counts_by_date:
+        st.markdown(
+            '<div class="crm-empty"><div class="crm-empty-title">No stage activity for these dates</div>'
+            'Adjust the date range or choose another workspace.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    header_top = ['<th class="crm-date-head" rowspan="2">Date</th>']
+    header_sub = []
+    for stage in stage_names:
+        columns = STAGE_STATUS_COLUMNS[stage]
+        header_top.append(f'<th colspan="{len(columns)}">{escape(stage)}</th>')
+        for _key, label in columns:
+            header_sub.append(f'<th>{escape(label)}</th>')
+
+    table = [
+        '<div class="crm-stage-table-wrap"><table class="crm-stage-table">',
+        '<thead><tr>', "".join(header_top), '</tr><tr>',
+        "".join(header_sub), '</tr></thead><tbody>',
+    ]
+    for day in sorted(counts_by_date.keys(), reverse=True):
+        table.append(f'<tr><td class="crm-date-cell">{day.strftime("%d-%m-%Y")}</td>')
+        per_day = counts_by_date[day]
+        for stage in stage_names:
+            for status_key, _label in STAGE_STATUS_COLUMNS[stage]:
+                value = _status_count(per_day.get(stage, {}).get(status_key, 0))
+                zero_class = " crm-count-zero" if value == 0 else ""
+                table.append(f'<td class="{zero_class.strip()}">{value:,}</td>')
+        table.append('</tr>')
+    table.append('</tbody></table></div>')
+    st.markdown("".join(table), unsafe_allow_html=True)
 
 
 # =========================================================
@@ -910,7 +1192,7 @@ except Exception as exc:
 if selected_page == "Overview":
     section_heading(
         "Overview",
-        "Filter by application date and see current queues alongside completed stage outcomes.",
+        "Filter by application date and review stage-specific outcomes and pending queues.",
         "AT A GLANCE",
     )
     if sales_load_error:
@@ -943,24 +1225,8 @@ if selected_page == "Overview":
         dashboard_sales = filter_sales_by_date(sales, filter_start, filter_end)
         st.caption(f"Showing applications created {filter_start:%d-%m-%Y} to {filter_end:%d-%m-%Y} · {len(dashboard_sales):,} matching application(s).")
 
-        total_sales = len(dashboard_sales)
-        pending_count = sum(1 for item in dashboard_sales if item.get("status") == "Pending")
-        approved_count = sum(1 for item in dashboard_sales if item.get("status") == "Approved")
-        live_count = sum(1 for item in dashboard_sales if item.get("status") == "Live")
-        cancelled_count = sum(1 for item in dashboard_sales if item.get("status") == "Cancelled")
-        rejected_count = sum(1 for item in dashboard_sales if item.get("status") == "Rejected")
-
-        metric_row_one = st.columns(3)
-        metric_row_one[0].metric("Applications", f"{total_sales:,}")
-        metric_row_one[1].metric("Pending", f"{pending_count:,}")
-        metric_row_one[2].metric("Approved / in progress", f"{approved_count:,}")
-        metric_row_two = st.columns(3)
-        metric_row_two[0].metric("Live", f"{live_count:,}")
-        metric_row_two[1].metric("Cancelled", f"{cancelled_count:,}")
-        metric_row_two[2].metric("Rejected", f"{rejected_count:,}")
-
-        # Load audit history for these applications so stage completions remain
-        # visible even after the application has moved to a later stage.
+        # Load audit history for these applications before creating stage cards
+        # and the date-by-stage table. The selected date range filters both.
         history_rows = []
         history_error = None
         try:
@@ -968,19 +1234,55 @@ if selected_page == "Overview":
         except Exception as exc:
             history_error = exc
 
+        relevant_stages = relevant_stage_names(profile)
+        stage_rpc_error = None
+        try:
+            counts_by_date = load_stage_breakdown_from_rpc(
+                filter_start, filter_end, dashboard_sales
+            )
+        except Exception as exc:
+            # Keep the workspace usable if the optional aggregate migration is
+            # not yet installed. The fallback is accurate for roles that can
+            # view all of their applications, but prior departments may lack
+            # completed cases that have since moved to a different queue.
+            stage_rpc_error = exc
+            counts_by_date = build_stage_breakdown_by_date(
+                dashboard_sales, history_rows
+            )
+        aggregate_counts = aggregate_stage_counts(counts_by_date)
+
+        section_heading(
+            "Stage overview",
+            "One concise card per workflow stage. Counts respond to the selected sale-date range.",
+            "STAGE KPIs",
+        )
+        render_stage_kpi_cards(aggregate_counts, relevant_stages)
+
         st.write("")
         section_heading(
             "Stage and status breakdown",
-            "Counts by workflow stage. Completed outcomes are taken from stage history, while Pending reflects the current queue.",
-            "PIPELINE DETAIL",
+            "Each row represents the application's creation date. Grouped columns show each stage's outcomes; completed milestones remain counted after an application moves forward.",
+            "DAILY PIPELINE DETAIL",
         )
-        stage_rows = build_stage_breakdown(dashboard_sales, history_rows)
-        st.dataframe(stage_rows, width="stretch", hide_index=True)
-        if history_error:
+        render_stage_breakdown_table(counts_by_date, relevant_stages)
+        if stage_rpc_error:
             st.warning(
-                "Stage history could not be loaded. Counts for completed stages may be incomplete; check sale_history SELECT access. "
-                f"Details: {history_error}"
+                "The secure historical stage-count function is not available, so counts are being calculated from records visible in this workspace. "
+                "For complete historical totals for department staff after applications move to another team, run the accompanying Supabase SQL migration. "
+                f"Details: {stage_rpc_error}"
             )
+        if history_error:
+            if stage_rpc_error:
+                st.warning(
+                    "Supplemental history could not be loaded, and the secure historical stage-count function is unavailable. "
+                    "Department completed-stage totals may be incomplete until the accompanying Supabase SQL migration is run. "
+                    f"Details: {history_error}"
+                )
+            else:
+                st.caption(
+                    "The secure stage-count summary above loaded successfully. A separate supplemental history panel could not be populated. "
+                    f"Details: {history_error}"
+                )
 
         left, right = st.columns([1.05, 1])
         with left:
