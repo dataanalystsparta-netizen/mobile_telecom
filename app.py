@@ -8,12 +8,15 @@ import streamlit as st
 from supabase import create_client
 
 
+LOGO_URL = "https://raw.githubusercontent.com/dataanalystsparta-netizen/logos/refs/heads/main/Gemini_Generated_Image_f8e0idf8e0idf8e0.png"
+
+
 # =========================================================
 # PAGE CONFIGURATION + VISUAL SYSTEM
 # =========================================================
 st.set_page_config(
-    page_title="Sales CRM",
-    page_icon="📋",
+    page_title="Sparta Mobile CRM",
+    page_icon="📱",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -93,11 +96,11 @@ def apply_crm_theme() -> None:
             display: flex; align-items: center; gap: .75rem;
             padding: .4rem .15rem .8rem;
         }
-        .crm-brand-icon {
-            width: 42px; height: 42px; display: grid; place-items: center;
-            border-radius: 13px; color: white; font-size: 1.25rem; font-weight: 800;
-            background: linear-gradient(145deg, #6e8aff, #3656c9);
-            box-shadow: 0 8px 22px rgba(22,47,120,.32);
+        .crm-brand-logo {
+            width: 46px; height: 46px; flex: 0 0 46px; object-fit: contain;
+            border-radius: 13px; padding: 3px; background: #fff;
+            border: 1px solid rgba(255,255,255,.28);
+            box-shadow: 0 8px 22px rgba(4,12,28,.24);
         }
         .crm-brand-name { font-size: 1.05rem; font-weight: 760; letter-spacing: -.025em; }
         .crm-brand-sub { color: #a9bad0; font-size: .74rem; margin-top: .12rem; }
@@ -138,7 +141,13 @@ def apply_crm_theme() -> None:
         .crm-soft-note { background: #f0f5ff; border: 1px solid #dce6ff; border-radius: 12px; padding: .8rem 1rem; color: #40557f; font-size: .86rem; }
         .crm-login-title { font-size: 2.15rem; font-weight: 820; letter-spacing: -.06em; line-height: 1.12; color: var(--crm-ink); }
         .crm-login-copy { color: var(--crm-muted); font-size: .95rem; margin: .65rem 0 1.3rem; }
-        .crm-login-mark { width: 58px; height: 58px; border-radius: 18px; display: grid; place-items: center; color: white; font-size: 1.55rem; font-weight: 800; background: linear-gradient(145deg, #6e8aff, #3656c9); box-shadow: 0 10px 28px rgba(65,105,225,.24); margin-bottom: 1.15rem; }
+        .crm-login-logo {
+            width: 78px; height: 78px; object-fit: contain; display: block;
+            border-radius: 21px; padding: 5px; background: #fff;
+            border: 1px solid #e3e9f2;
+            box-shadow: 0 10px 28px rgba(24,43,79,.10);
+            margin-bottom: 1.15rem;
+        }
         [data-testid="stMetric"] {
             background: #fff; border: 1px solid var(--crm-border); border-radius: 15px;
             padding: 1.05rem 1.15rem; box-shadow: 0 3px 12px rgba(25,47,82,.025);
@@ -525,10 +534,10 @@ if "user_id" not in st.session_state:
     left, login_col, right = st.columns([1, 1.05, 1])
     with login_col:
         st.markdown(
-            """
+            f"""
             <div style="padding:2.1rem .2rem .8rem">
-              <div class="crm-login-mark">S</div>
-              <div class="crm-eyebrow">SALES OPERATIONS PLATFORM</div>
+              <img class="crm-login-logo" src="{LOGO_URL}" alt="Sparta Mobile CRM logo">
+              <div class="crm-eyebrow">MOBILE SALES OPERATIONS</div>
               <div class="crm-login-title" style="margin-top:.45rem">Welcome back.</div>
               <div class="crm-login-copy">Sign in to access your sales workspace and assigned operations.</div>
             </div>
@@ -538,7 +547,7 @@ if "user_id" not in st.session_state:
         with st.form("login_form"):
             username = st.text_input("Username", placeholder="Enter your username")
             password = st.text_input("Password", type="password", placeholder="Enter your password")
-            submitted = st.form_submit_button("Sign in to CRM", type="primary", width="stretch")
+            submitted = st.form_submit_button("Sign in to Sparta Mobile CRM", type="primary", width="stretch")
 
         if submitted:
             username = username.strip().lower()
@@ -617,10 +626,10 @@ if st.session_state.get("crm_navigation") not in nav_options:
     st.session_state["crm_navigation"] = "Overview"
 with st.sidebar:
     st.markdown(
-        """
+        f"""
         <div class="crm-brand">
-          <div class="crm-brand-icon">S</div>
-          <div><div class="crm-brand-name">Sales CRM</div><div class="crm-brand-sub">Sales & operations</div></div>
+          <img class="crm-brand-logo" src="{LOGO_URL}" alt="Sparta Mobile CRM logo">
+          <div><div class="crm-brand-name">Sparta Mobile CRM</div><div class="crm-brand-sub">Mobile sales operations</div></div>
         </div>
         <div class="crm-nav-label">WORKSPACE</div>
         """,
@@ -677,7 +686,7 @@ st.markdown(
     f"""
     <div class="crm-page-header">
       <div>
-        <div class="crm-eyebrow">SALES CRM · OPERATIONS</div>
+        <div class="crm-eyebrow">SPARTA MOBILE CRM · OPERATIONS</div>
         <div class="crm-page-title">{escape(role_title)}</div>
         <div class="crm-page-subtitle">{escape(role_subtitle)}</div>
       </div>
@@ -1375,6 +1384,6 @@ if selected_page == "Cancellation Register":
 # FOOTER
 # =========================================================
 st.markdown(
-    '<div class="crm-footer">Sales CRM · Secure department workflow · Application history and audit trail</div>',
+    '<div class="crm-footer">Sparta Mobile CRM · Secure department workflow · Application history and audit trail</div>',
     unsafe_allow_html=True,
 )
