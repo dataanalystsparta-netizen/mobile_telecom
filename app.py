@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime
 from html import escape
 
 import streamlit as st
@@ -304,15 +304,59 @@ def section_heading(title: str, description: str = "", kicker: str = "WORKSPACE"
 
 
 def parse_db_date(value, default=None):
-    """Convert a Supabase date/datetime value into datetime.date."""
+    """Convert Supabase date/datetime values into datetime.date."""
+    if isinstance(value, datetime):
+        return value.date()
     if isinstance(value, date):
         return value
     if isinstance(value, str) and value.strip():
+        text = value.strip()
         try:
-            return date.fromisoformat(value.strip()[:10])
+            return date.fromisoformat(text[:10])
         except ValueError:
-            pass
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+            except ValueError:
+                pass
     return default
+
+
+def format_date(value, fallback="—"):
+    """Format database dates/timestamps consistently as DD-MM-YYYY."""
+    parsed = parse_db_date(value)
+    return parsed.strftime("%d-%m-%Y") if parsed else fallback
+
+
+def sale_created_date(sale):
+    """The current schema uses created_at as the application/sale date."""
+    return parse_db_date(sale.get("created_at"))
+
+
+def filter_sales_by_date(sales_to_filter, start_date, end_date):
+    """Inclusive sale-date filter; undated records are excluded when filtering."""
+    filtered = []
+    for item in sales_to_filter:
+        sale_date = sale_created_date(item)
+        if sale_date and start_date <= sale_date <= end_date:
+            filtered.append(item)
+    return filtered
+
+
+def normalise_date_range(selected, default_start, default_end):
+    """Normalise Streamlit's date/range return values, including partial selections."""
+    if isinstance(selected, (tuple, list)):
+        if len(selected) >= 2:
+            start = selected[0] if isinstance(selected[0], date) else default_start
+            end = selected[1] if isinstance(selected[1], date) else default_end
+        elif len(selected) == 1 and isinstance(selected[0], date):
+            start = end = selected[0]
+        else:
+            start, end = default_start, default_end
+    elif isinstance(selected, date):
+        start = end = selected
+    else:
+        start, end = default_start, default_end
+    return (start, end) if start <= end else (end, start)
 
 
 def clean_text(value):
@@ -387,26 +431,59 @@ def display_author(changed_by, profile, user_id):
 
 
 def status_chip_class(status):
+    """Semantic colour for a user-facing workflow status label."""
     value = (status or "").strip().lower()
-    if value == "live" or value == "approved":
-        return "crm-chip-green"
-    if value == "cancelled" or value == "rejected":
+    if any(token in value for token in ("cancel", "reject", "not committed")):
         return "crm-chip-red"
-    if value == "pending":
+    if any(token in value for token in ("pending", "callback", "no answer", "not recorded")):
         return "crm-chip-amber"
+    if value == "live" or any(token in value for token in ("approved", "done", "committed", "complete", "authorised")):
+        return "crm-chip-green"
     return "crm-chip-blue"
 
 
-def show_status_chips(stage, status, department):
+def workflow_status_label(sale):
+    """Readable stage-aware status, not just the database's generic status."""
+    stage = str(sale.get("current_stage") or "").strip()
+    status = str(sale.get("status") or "").strip()
+    outcome = str(sale.get("committed_call") or "").strip()
+
+    if status == "Cancelled":
+        return "Cancelled"
+    if status == "Rejected":
+        return "Quality Rejected"
+    if status == "Live":
+        return "Live"
+    if stage == "Quality":
+        return "Quality Pending" if status == "Pending" else f"Quality {status or 'In Progress'}"
+    if stage == "DD Setup":
+        return "DD Setup Pending" if status == "Pending" else f"DD Setup {status or 'In Progress'}"
+    if stage == "Letter Sending":
+        return "Letter Sending Pending" if status == "Pending" else f"Letter Sending {status or 'In Progress'}"
+    if stage == "Confirmation Call":
+        if outcome and outcome != "Select outcome":
+            return f"Confirmation Call {outcome}"
+        return "Confirmation Call Pending"
+    if stage == "SIM + Hardware Provisioning":
+        if status == "Approved":
+            return "Provisioning Pending"
+        return f"Provisioning {status or 'Pending'}"
+    if stage == "Live":
+        return "Live Authorisation Pending" if status == "Pending" else f"Live Authorisation {status or 'In Progress'}"
+    if stage:
+        return f"{stage} {status}".strip()
+    return status or "Unassigned"
+
+
+def show_status_chips(stage, status, department, sale=None):
+    sale = sale or {"current_stage": stage, "status": status}
+    status_label = workflow_status_label(sale)
     chips = (
+        f'<span class="crm-chip {status_chip_class(status_label)}">{escape(status_label)}</span>'
         f'<span class="crm-chip crm-chip-blue">{escape(str(stage or "-"))}</span>'
-        f'<span class="crm-chip {status_chip_class(status)}">{escape(str(status or "-"))}</span>'
         f'<span class="crm-chip crm-chip-gray">{escape(str(department or "-"))}</span>'
     )
-    st.markdown(
-        f'<div class="crm-status-line">{chips}</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="crm-status-line">{chips}</div>', unsafe_allow_html=True)
 
 
 def load_sale_history(sale_id):
@@ -425,25 +502,143 @@ def load_sale_history(sale_id):
 
 
 def load_sales_for_user(profile, user_id):
-    query = (
-        supabase.table("sales")
-        .select(
-            "id, customer_name, customer_phone, created_by, assigned_department, "
-            "current_stage, status, rejection_reason, created_at, updated_at, "
-            "address, post_code, sort_code, account_number, bank_name, "
-            "package_offered, contract_duration, dd_reference_number, payment_date, "
-            "letter_sent_date, committed_call, committed_call_comments, "
-            "provisioning_date, sim_number, live_date, cancellation_reason, "
-            "cancellation_date, cancelled_by"
+    """Load all records visible to this role in pages, not an arbitrary first 200."""
+    def base_query():
+        query = (
+            supabase.table("sales")
+            .select(
+                "id, customer_name, customer_phone, created_by, assigned_department, "
+                "current_stage, status, rejection_reason, created_at, updated_at, "
+                "address, post_code, sort_code, account_number, bank_name, "
+                "package_offered, contract_duration, dd_reference_number, payment_date, "
+                "letter_sent_date, committed_call, committed_call_comments, "
+                "provisioning_date, sim_number, live_date, cancellation_reason, "
+                "cancellation_date, cancelled_by"
+            )
+            .order("created_at", desc=True)
         )
-        .order("created_at", desc=True)
-    )
-    role = profile.get("role")
-    if role == "agent":
-        query = query.eq("created_by", str(user_id))
-    elif role == "department_staff":
-        query = query.eq("assigned_department", profile.get("department"))
-    return query.limit(200).execute().data or []
+        role = profile.get("role")
+        if role == "agent":
+            query = query.eq("created_by", str(user_id))
+        elif role == "department_staff":
+            query = query.eq("assigned_department", profile.get("department"))
+        return query
+
+    rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        batch = base_query().range(offset, offset + page_size - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
+def load_history_for_sales(sale_ids):
+    """Load stage history for a collection of visible sales to audit stage completions."""
+    ids = [str(sale_id) for sale_id in sale_ids if sale_id]
+    if not ids:
+        return []
+    all_rows = []
+    # Moderate IN-list size to avoid long request URLs on larger installations.
+    for index in range(0, len(ids), 75):
+        id_chunk = ids[index:index + 75]
+        offset = 0
+        page_size = 1000
+        while True:
+            response = (
+                supabase.table("sale_history")
+                .select("sale_id, changed_by, previous_stage, new_stage, action, remarks, created_at")
+                .in_("sale_id", id_chunk)
+                .order("created_at", desc=False)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            batch = response.data or []
+            all_rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+    return all_rows
+
+
+def build_stage_breakdown(stage_sales, history_rows):
+    """Count current queue and completed historical milestones by stage/status."""
+    stage_names = [
+        "Quality",
+        "DD Setup",
+        "Letter Sending",
+        "Confirmation Call",
+        "SIM + Hardware Provisioning",
+        "Live Authorisation",
+    ]
+    buckets = {
+        stage: {key: set() for key in ("Pending", "Approved / Done", "Rejected", "Cancelled", "Live")}
+        for stage in stage_names
+    }
+    sale_by_id = {str(s.get("id")): s for s in stage_sales if s.get("id")}
+
+    # Current records represent the application's present state.
+    for sale_id, sale in sale_by_id.items():
+        stage = sale.get("current_stage")
+        status = sale.get("status")
+        if status == "Rejected":
+            buckets["Quality"]["Rejected"].add(sale_id)
+        elif status == "Cancelled":
+            row_stage = "Live Authorisation" if stage == "Live" else stage
+            if row_stage in buckets:
+                buckets[row_stage]["Cancelled"].add(sale_id)
+        elif status == "Live":
+            buckets["Live Authorisation"]["Live"].add(sale_id)
+        elif stage == "Quality" and status == "Pending":
+            buckets["Quality"]["Pending"].add(sale_id)
+        elif stage == "DD Setup" and status == "Pending":
+            buckets["DD Setup"]["Pending"].add(sale_id)
+        elif stage == "Letter Sending" and status == "Pending":
+            buckets["Letter Sending"]["Pending"].add(sale_id)
+        elif stage == "Confirmation Call" and status == "Pending":
+            buckets["Confirmation Call"]["Pending"].add(sale_id)
+        elif stage == "SIM + Hardware Provisioning" and status in ("Approved", "Pending"):
+            buckets["SIM + Hardware Provisioning"]["Pending"].add(sale_id)
+        elif stage == "Live" and status == "Pending":
+            buckets["Live Authorisation"]["Pending"].add(sale_id)
+
+    # Stage completions remain visible after the application moves to a later stage.
+    for event in history_rows:
+        sale_id = str(event.get("sale_id") or "")
+        if sale_id not in sale_by_id:
+            continue
+        action = str(event.get("action") or "").strip().lower()
+        previous = str(event.get("previous_stage") or "").strip()
+        new_stage = str(event.get("new_stage") or "").strip()
+
+        if previous == "Quality" and ("approv" in action or new_stage == "DD Setup"):
+            buckets["Quality"]["Approved / Done"].add(sale_id)
+        if previous == "Quality" and ("reject" in action or new_stage == "Rejected"):
+            buckets["Quality"]["Rejected"].add(sale_id)
+        if (previous == "DD Setup" and new_stage == "Letter Sending") or "complete dd setup" in action:
+            buckets["DD Setup"]["Approved / Done"].add(sale_id)
+        if (previous == "Letter Sending" and new_stage == "Confirmation Call") or action == "letter sent":
+            buckets["Letter Sending"]["Approved / Done"].add(sale_id)
+        if previous == "Confirmation Call" and new_stage == "SIM + Hardware Provisioning":
+            buckets["Confirmation Call"]["Approved / Done"].add(sale_id)
+        if "approved" in action and previous == "Confirmation Call":
+            buckets["Confirmation Call"]["Approved / Done"].add(sale_id)
+        if (previous == "SIM + Hardware Provisioning" and new_stage == "Live") or "complete provisioning" in action:
+            buckets["SIM + Hardware Provisioning"]["Approved / Done"].add(sale_id)
+
+    rows = []
+    for stage in stage_names:
+        values = buckets[stage]
+        # A sale may count in multiple stages over its life; each row is a stage-specific audit.
+        row = {"Stage": stage}
+        for key in ("Pending", "Approved / Done", "Rejected", "Cancelled", "Live"):
+            row[key] = len(values[key])
+        row["Total in stage"] = len(set().union(*values.values()))
+        rows.append(row)
+    return rows
 
 
 # =========================================================
@@ -713,78 +908,132 @@ except Exception as exc:
 
 
 if selected_page == "Overview":
-    section_heading("Overview", "A concise view of applications visible to your account.", "AT A GLANCE")
+    section_heading(
+        "Overview",
+        "Filter by application date and see current queues alongside completed stage outcomes.",
+        "AT A GLANCE",
+    )
     if sales_load_error:
         st.error(f"Unable to load sales records. Check database access policies and schema migration. Details: {sales_load_error}")
     else:
-        total_sales = len(sales)
-        pending_count = sum(1 for item in sales if item.get("status") == "Pending")
-        approved_count = sum(1 for item in sales if item.get("status") == "Approved")
-        live_count = sum(1 for item in sales if item.get("status") == "Live")
-        cancelled_count = sum(1 for item in sales if item.get("status") == "Cancelled")
-        rejected_count = sum(1 for item in sales if item.get("status") == "Rejected")
+        available_dates = [sale_created_date(item) for item in sales]
+        available_dates = [item for item in available_dates if item]
+        default_end = max([date.today(), *available_dates])
+        default_start = min(available_dates) if available_dates else default_end
 
-        if is_live_auth_user:
-            pending_live_count = sum(
-                1 for item in sales
-                if item.get("current_stage") == "Live"
-                and item.get("status") == "Pending"
-                and item.get("assigned_department") == LIVE_AUTH_DEPARTMENT
+        filter_cols = st.columns([1.6, 1, 1])
+        with filter_cols[0]:
+            selected_dates = st.date_input(
+                "Sale date range",
+                value=(default_start, default_end),
+                format="DD-MM-YYYY",
+                key="overview_sale_date_range",
+                help="Uses the application creation date recorded in the CRM.",
             )
-            metric_cols = st.columns(4)
-            metric_cols[0].metric("Awaiting Live decision", pending_live_count)
-            metric_cols[1].metric("Applications in queue", total_sales)
-            metric_cols[2].metric("Authorised Live", live_count)
-            metric_cols[3].metric("Cancelled", cancelled_count)
-        else:
-            metric_cols = st.columns(4)
-            metric_cols[0].metric("Applications", total_sales)
-            metric_cols[1].metric("Pending", pending_count)
-            metric_cols[2].metric("In progress", approved_count)
-            metric_cols[3].metric("Completed / closed", live_count + cancelled_count + rejected_count)
+        with filter_cols[1]:
+            st.caption("DATE BASIS")
+            st.markdown("**Application created**")
+        with filter_cols[2]:
+            st.caption("RECORDS AVAILABLE")
+            st.markdown(f"**{len(sales):,}**")
+        filter_start, filter_end = normalise_date_range(
+            selected_dates, default_start, default_end
+        )
+
+        dashboard_sales = filter_sales_by_date(sales, filter_start, filter_end)
+        st.caption(f"Showing applications created {filter_start:%d-%m-%Y} to {filter_end:%d-%m-%Y} · {len(dashboard_sales):,} matching application(s).")
+
+        total_sales = len(dashboard_sales)
+        pending_count = sum(1 for item in dashboard_sales if item.get("status") == "Pending")
+        approved_count = sum(1 for item in dashboard_sales if item.get("status") == "Approved")
+        live_count = sum(1 for item in dashboard_sales if item.get("status") == "Live")
+        cancelled_count = sum(1 for item in dashboard_sales if item.get("status") == "Cancelled")
+        rejected_count = sum(1 for item in dashboard_sales if item.get("status") == "Rejected")
+
+        metric_row_one = st.columns(3)
+        metric_row_one[0].metric("Applications", f"{total_sales:,}")
+        metric_row_one[1].metric("Pending", f"{pending_count:,}")
+        metric_row_one[2].metric("Approved / in progress", f"{approved_count:,}")
+        metric_row_two = st.columns(3)
+        metric_row_two[0].metric("Live", f"{live_count:,}")
+        metric_row_two[1].metric("Cancelled", f"{cancelled_count:,}")
+        metric_row_two[2].metric("Rejected", f"{rejected_count:,}")
+
+        # Load audit history for these applications so stage completions remain
+        # visible even after the application has moved to a later stage.
+        history_rows = []
+        history_error = None
+        try:
+            history_rows = load_history_for_sales([item.get("id") for item in dashboard_sales])
+        except Exception as exc:
+            history_error = exc
 
         st.write("")
-        left, right = st.columns([1.15, 1])
+        section_heading(
+            "Stage and status breakdown",
+            "Counts by workflow stage. Completed outcomes are taken from stage history, while Pending reflects the current queue.",
+            "PIPELINE DETAIL",
+        )
+        stage_rows = build_stage_breakdown(dashboard_sales, history_rows)
+        st.dataframe(stage_rows, width="stretch", hide_index=True)
+        if history_error:
+            st.warning(
+                "Stage history could not be loaded. Counts for completed stages may be incomplete; check sale_history SELECT access. "
+                f"Details: {history_error}"
+            )
+
+        left, right = st.columns([1.05, 1])
         with left:
-            section_heading("Workflow snapshot", "Where visible applications currently sit.", "PIPELINE")
-            stage_counts = {}
-            for item in sales:
-                stage_name = item.get("current_stage") or "Unassigned"
-                stage_counts[stage_name] = stage_counts.get(stage_name, 0) + 1
-            if stage_counts:
-                sorted_stages = sorted(stage_counts.items(), key=lambda pair: (-pair[1], pair[0]))
-                for stage_name, count in sorted_stages[:8]:
-                    with st.container(border=True):
-                        c1, c2 = st.columns([4, 1])
-                        c1.markdown(f"**{escape(stage_name)}**")
-                        c2.markdown(f"<div style='text-align:right;font-weight:800;color:#4169e1'>{count}</div>", unsafe_allow_html=True)
-                        st.progress(count / max(total_sales, 1))
-                    st.write("")
-            else:
-                st.markdown('<div class="crm-empty"><div class="crm-empty-title">No applications yet</div>Applications will appear here when they are created.</div>', unsafe_allow_html=True)
+            section_heading("Confirmation call outcomes", "Call outcomes recorded across the selected applications.", "CALL RESULTS")
+            call_stage_ids = set()
+            for item in dashboard_sales:
+                item_id = str(item.get("id") or "")
+                current_stage = item.get("current_stage")
+                if current_stage in ("Confirmation Call", "SIM + Hardware Provisioning", "Live") or item.get("committed_call"):
+                    call_stage_ids.add(item_id)
+            for event in history_rows:
+                if event.get("previous_stage") == "Confirmation Call" or event.get("new_stage") == "Confirmation Call":
+                    call_stage_ids.add(str(event.get("sale_id") or ""))
+            call_stage_sales = [item for item in dashboard_sales if str(item.get("id") or "") in call_stage_ids]
+            call_outcomes = ["Committed", "Not Committed", "Callback Requested", "No Answer", "Other", "Not recorded"]
+            outcome_rows = []
+            for outcome in call_outcomes:
+                if outcome == "Not recorded":
+                    count = sum(1 for item in call_stage_sales if not item.get("committed_call") or item.get("committed_call") == "Select outcome")
+                else:
+                    count = sum(1 for item in call_stage_sales if item.get("committed_call") == outcome)
+                outcome_rows.append({"Call outcome": outcome, "Applications": count})
+            st.dataframe(outcome_rows, width="stretch", hide_index=True)
+            st.caption(f"Confirmation Call reached by {len(call_stage_sales):,} application(s) in this date range.")
         with right:
-            section_heading("Recently updated", "The latest applications in your visible queue.", "RECENT ACTIVITY")
-            if sales:
-                for item in sales[:6]:
-                    customer = item.get("customer_name") or "Unnamed Sale"
+            section_heading("Recently updated", "Most recently changed applications in your visible queue.", "RECENT ACTIVITY")
+            recently_updated = sorted(
+                dashboard_sales,
+                key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+                reverse=True,
+            )[:6]
+            if recently_updated:
+                for item in recently_updated:
+                    customer = item.get("customer_name") or "Unnamed sale"
                     stage_name = item.get("current_stage") or "-"
                     status_name = item.get("status") or "-"
                     dept = item.get("assigned_department") or "-"
                     with st.container(border=True):
                         st.markdown(f"**{escape(customer)}**")
-                        show_status_chips(stage_name, status_name, dept)
-                        st.caption(f"Updated {item.get('updated_at') or item.get('created_at') or '-'}")
+                        show_status_chips(stage_name, status_name, dept, sale=item)
+                        st.caption(f"Updated {format_date(item.get('updated_at') or item.get('created_at'))}")
             else:
-                st.markdown('<div class="crm-empty"><div class="crm-empty-title">Nothing to review</div>Create a new sale or check back when applications are assigned.</div>', unsafe_allow_html=True)
+                st.markdown('<div class="crm-empty"><div class="crm-empty-title">No applications in this date range</div>Adjust the date filter to view other applications.</div>', unsafe_allow_html=True)
+
         st.write("")
         quick_cols = st.columns(3 if role == "admin" else 2)
         with quick_cols[0]:
-            st.markdown('<div class="crm-panel"><b>Sales records</b><br><span style="color:#68788e;font-size:.85rem">Search and review applications and their history.</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="crm-panel"><b>Sales records</b><br><span style="color:#68788e;font-size:.85rem">Search applications and review their history.</span></div>', unsafe_allow_html=True)
         with quick_cols[1]:
-            st.markdown('<div class="crm-panel"><b>New application</b><br><span style="color:#68788e;font-size:.85rem">Capture the customer and sales details.</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="crm-panel"><b>New application</b><br><span style="color:#68788e;font-size:.85rem">Capture customer and sales details.</span></div>', unsafe_allow_html=True)
         if role == "admin":
             with quick_cols[2]:
-                st.markdown('<div class="crm-panel"><b>Cancellation register</b><br><span style="color:#68788e;font-size:.85rem">Audit closed and cancelled records.</span></div>', unsafe_allow_html=True)
+                st.markdown('<div class="crm-panel"><b>Administration</b><br><span style="color:#68788e;font-size:.85rem">Manage employee accounts and review cancellations.</span></div>', unsafe_allow_html=True)
 
 
 # =========================================================
@@ -866,9 +1115,10 @@ if selected_page == "User Management" and role == "admin":
     try:
         require_active_admin()
         users_result = get_admin_supabase().table("profiles").select(
-            "full_name, username, role, department, is_active, created_at"
+            "id, full_name, username, role, department, is_active, created_at"
         ).order("full_name").limit(500).execute()
-        users = users_result.data or []
+        all_users = users_result.data or []
+        users = list(all_users)
         if users:
             search_user = st.text_input("Search employees", placeholder="Name, username, role or department…", key="user_search")
             search_lower = search_user.strip().lower()
@@ -882,13 +1132,130 @@ if selected_page == "User Management" and role == "admin":
                     "Role": (u.get("role") or "-").replace("_", " ").title(),
                     "Department": u.get("department") or "-",
                     "Active": "Yes" if u.get("is_active") else "No",
-                    "Created": u.get("created_at") or "-",
+                    "Created": format_date(u.get("created_at")),
                 } for u in users
             ], width="stretch", hide_index=True)
         else:
             st.info("No employee profiles were found.")
-    except Exception:
-        st.error("Unable to load the employee list.")
+
+        st.write("")
+        section_heading(
+            "Remove or deactivate access",
+            "Deactivation preserves sales and audit records. Permanent deletion is allowed only for accounts with no linked sales or workflow history.",
+            "ACCOUNT CONTROL",
+        )
+        manageable_users = [u for u in all_users if str(u.get("id")) != user_id]
+        if not manageable_users:
+            st.info("There are no other employee accounts to manage.")
+        else:
+            with st.container(border=True):
+                chosen_user_label_map = {
+                    f"{u.get('full_name') or 'Unnamed'} (@{u.get('username') or '-'}) · {(u.get('role') or '-').replace('_', ' ').title()}": u
+                    for u in manageable_users
+                }
+                chosen_user_label = st.selectbox(
+                    "Employee account",
+                    list(chosen_user_label_map.keys()),
+                    key="account_control_employee",
+                )
+                target_user = chosen_user_label_map[chosen_user_label]
+                target_id = str(target_user.get("id"))
+                target_username = str(target_user.get("username") or "")
+                target_is_admin = target_user.get("role") == "admin"
+                action_cols = st.columns([1, 1.5])
+                with action_cols[0]:
+                    account_action = st.radio(
+                        "Action",
+                        ["Deactivate account", "Permanently delete account"],
+                        key="account_control_action",
+                    )
+                with action_cols[1]:
+                    st.caption("SELECTED ACCOUNT")
+                    st.markdown(f"**{escape(target_user.get('full_name') or 'Unnamed')}**")
+                    st.caption(
+                        f"@{target_username} · {'Active' if target_user.get('is_active') else 'Inactive'}"
+                    )
+
+                if account_action == "Deactivate account":
+                    st.warning("The employee will no longer be able to use the CRM. Their sales and history will remain available for audit.")
+                    if st.button("Deactivate employee", key="deactivate_employee_button", type="secondary", width="stretch"):
+                        try:
+                            require_active_admin()
+                            if target_is_admin:
+                                active_admins = (
+                                    get_admin_supabase().table("profiles")
+                                    .select("id")
+                                    .eq("role", "admin")
+                                    .eq("is_active", True)
+                                    .execute().data or []
+                                )
+                                if len(active_admins) <= 1:
+                                    st.error("The last active Admin account cannot be deactivated.")
+                                    st.stop()
+                            get_admin_supabase().table("profiles").update({"is_active": False}).eq("id", target_id).execute()
+                            st.success(f"Access deactivated for @{target_username}. Sales and audit history were preserved.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Unable to deactivate this account. Details: {exc}")
+                else:
+                    st.warning("Permanent deletion cannot be undone. To protect customer records and audit history, accounts referenced by sales or workflow events cannot be permanently deleted; deactivate those accounts instead.")
+                    confirm_username = st.text_input(
+                        f"Type {target_username} to confirm permanent deletion",
+                        key="delete_employee_username_confirmation",
+                    )
+                    confirm_delete = st.checkbox(
+                        "I understand this permanently removes the employee's login account.",
+                        key="delete_employee_acknowledgement",
+                    )
+                    if st.button("Permanently delete employee", key="delete_employee_button", type="primary", width="stretch"):
+                        if target_is_admin:
+                            active_admins = (
+                                get_admin_supabase().table("profiles")
+                                .select("id")
+                                .eq("role", "admin")
+                                .eq("is_active", True)
+                                .execute().data or []
+                            )
+                            if target_user.get("is_active") and len(active_admins) <= 1:
+                                st.error("The last active Admin account cannot be deleted.")
+                                st.stop()
+                        if confirm_username.strip().lower() != target_username.lower():
+                            st.warning("The confirmation username does not match.")
+                        elif not confirm_delete:
+                            st.warning("Please acknowledge the permanent deletion warning.")
+                        else:
+                            try:
+                                require_active_admin()
+                                admin_client = get_admin_supabase()
+                                sales_refs = (
+                                    admin_client.table("sales")
+                                    .select("id", count="exact")
+                                    .eq("created_by", target_id)
+                                    .limit(1)
+                                    .execute()
+                                )
+                                history_refs = (
+                                    admin_client.table("sale_history")
+                                    .select("id", count="exact")
+                                    .eq("changed_by", target_id)
+                                    .limit(1)
+                                    .execute()
+                                )
+                                if (sales_refs.count or 0) > 0 or (history_refs.count or 0) > 0:
+                                    st.error(
+                                        "This account is referenced by sales or workflow history, so it cannot be permanently deleted without risking the audit trail. "
+                                        "Choose Deactivate account instead."
+                                    )
+                                else:
+                                    admin_client.auth.admin.delete_user(target_id)
+                                    # Auth deletion generally cascades to profiles; this is a safe no-op if already removed.
+                                    admin_client.table("profiles").delete().eq("id", target_id).execute()
+                                    st.success(f"Employee account @{target_username} was permanently deleted.")
+                                    st.rerun()
+                            except Exception as exc:
+                                st.error(f"Unable to delete this account. Details: {exc}")
+    except Exception as exc:
+        st.error(f"Unable to load or manage employee accounts. Details: {exc}")
 
 
 # =========================================================
@@ -990,17 +1357,41 @@ if selected_page == "Sales Records":
             st.metric("Pending Live authorisations", pending_live_count)
             st.caption("Only pending sales assigned to Live authorisation are eligible for a final decision.")
 
+        record_dates = [sale_created_date(item) for item in sales]
+        record_dates = [item for item in record_dates if item]
+        record_default_end = max([date.today(), *record_dates])
+        record_default_start = min(record_dates) if record_dates else record_default_end
+        record_date_cols = st.columns([1.6, 1, 1])
+        with record_date_cols[0]:
+            record_date_range = st.date_input(
+                "Sale date range",
+                value=(record_default_start, record_default_end),
+                format="DD-MM-YYYY",
+                key="records_sale_date_range",
+            )
+        with record_date_cols[1]:
+            st.caption("DATE BASIS")
+            st.markdown("**Application created**")
+        with record_date_cols[2]:
+            st.caption("RECORDS AVAILABLE")
+            st.markdown(f"**{len(sales):,}**")
+        record_start, record_end = normalise_date_range(
+            record_date_range, record_default_start, record_default_end
+        )
+        date_filtered_sales = filter_sales_by_date(sales, record_start, record_end)
+        st.caption(f"Applications created {record_start:%d-%m-%Y} to {record_end:%d-%m-%Y}.")
+
         filter_cols = st.columns([2.2, 1, 1])
         with filter_cols[0]:
             search_sales = st.text_input("Search applications", placeholder="Customer, phone, reference, stage…", key="sales_search")
         with filter_cols[1]:
-            stage_values = sorted({str(s.get("current_stage") or "-") for s in sales})
+            stage_values = sorted({str(s.get("current_stage") or "-") for s in date_filtered_sales})
             chosen_stage = st.selectbox("Stage", ["All stages"] + stage_values, key="sales_stage_filter")
         with filter_cols[2]:
-            status_values = sorted({str(s.get("status") or "-") for s in sales})
+            status_values = sorted({workflow_status_label(s) for s in date_filtered_sales})
             chosen_status = st.selectbox("Status", ["All statuses"] + status_values, key="sales_status_filter")
 
-        visible_sales = list(sales)
+        visible_sales = list(date_filtered_sales)
         search_text = search_sales.strip().lower()
         if search_text:
             def matches_search(item):
@@ -1013,7 +1404,7 @@ if selected_page == "Sales Records":
         if chosen_stage != "All stages":
             visible_sales = [item for item in visible_sales if (item.get("current_stage") or "-") == chosen_stage]
         if chosen_status != "All statuses":
-            visible_sales = [item for item in visible_sales if (item.get("status") or "-") == chosen_status]
+            visible_sales = [item for item in visible_sales if workflow_status_label(item) == chosen_status]
 
         summary_cols = st.columns(3)
         summary_cols[0].metric("Visible records", len(visible_sales))
@@ -1024,7 +1415,7 @@ if selected_page == "Sales Records":
         if not visible_sales:
             st.markdown('<div class="crm-empty"><div class="crm-empty-title">No matching applications</div>Try a different search term or change the stage/status filters.</div>', unsafe_allow_html=True)
         else:
-            st.caption(f"Showing {len(visible_sales)} of {len(sales)} records available to your account. Open a record to see its details and permitted actions.")
+            st.caption(f"Showing {len(visible_sales)} of {len(date_filtered_sales)} records in the selected date range ({len(sales)} records available to your account). Open a record to see its details and permitted actions.")
 
         for sale in visible_sales:
             sale_id = str(sale["id"])
@@ -1036,8 +1427,8 @@ if selected_page == "Sales Records":
             is_quality_review = stage == "Quality" and assigned_department == "Quality" and status == "Pending"
             is_live_authorisation_record = stage == "Live" and assigned_department == LIVE_AUTH_DEPARTMENT and status == "Pending"
 
-            with st.expander(f"{customer}   ·   {status}", expanded=False):
-                show_status_chips(stage, status, assigned_department)
+            with st.expander(f"{customer}   ·   {workflow_status_label(sale)}", expanded=False):
+                show_status_chips(stage, status, assigned_department, sale=sale)
                 if role == "admin":
                     overview_tab, admin_tab, history_tab = st.tabs([
                         "Overview & workflow", "Cancellation override", "History"
@@ -1055,11 +1446,11 @@ if selected_page == "Sales Records":
                             "Cancelled · "
                             f"{sale.get('cancellation_reason') or sale.get('rejection_reason') or 'No reason recorded'}"
                         )
-                        st.caption(f"Cancellation date: {sale.get('cancellation_date') or '—'}")
+                        st.caption(f"Cancellation date: {format_date(sale.get('cancellation_date'))}")
                     elif status == "Rejected" and sale.get("rejection_reason"):
                         st.error(f"Rejected · {sale['rejection_reason']}")
                     elif status == "Live":
-                        st.success(f"Authorised as Live · {sale.get('live_date') or 'date not recorded'}")
+                        st.success(f"Authorised as Live · {format_date(sale.get('live_date'), fallback='date not recorded')}")
 
                     info_cols = st.columns([1.25, 1.25, 1.5])
                     with info_cols[0]:
@@ -1076,7 +1467,7 @@ if selected_page == "Sales Records":
                             f'<div style="font-size:.76rem;line-height:1.45;overflow-wrap:anywhere">{escape(sale_id)}</div>',
                             unsafe_allow_html=True,
                         )
-                        st.caption(f"{sale.get('updated_at') or sale.get('created_at') or '—'}")
+                        st.caption(f"Updated {format_date(sale.get('updated_at') or sale.get('created_at'))}")
 
                     # Long, mostly reference-only fields remain available without
                     # taking over the accordion every time it is opened.
@@ -1094,6 +1485,8 @@ if selected_page == "Sales Records":
                         detail_cols = st.columns(3)
                         for index, (label, field_name) in enumerate(customer_fields):
                             value = sale.get(field_name)
+                            if field_name in {"payment_date", "letter_sent_date", "provisioning_date", "live_date"}:
+                                value = format_date(value)
                             with detail_cols[index % 3]:
                                 st.caption(label)
                                 st.write(value if value not in (None, "") else "—")
@@ -1113,6 +1506,8 @@ if selected_page == "Sales Records":
                         milestone_cols = st.columns(3)
                         for index, (label, field_name) in enumerate(stage_fields):
                             value = sale.get(field_name)
+                            if field_name in {"payment_date", "letter_sent_date", "provisioning_date", "live_date"}:
+                                value = format_date(value)
                             with milestone_cols[index % 3]:
                                 st.caption(label)
                                 st.write(value if value not in (None, "") else "—")
@@ -1168,6 +1563,7 @@ if selected_page == "Sales Records":
                                     payment_date = st.date_input(
                                         "Payment date *",
                                         value=parse_db_date(sale.get("payment_date"), default=date.today()),
+                                        format="DD-MM-YYYY",
                                         key=f"payment_date_{sale_id}",
                                     )
                                 stage_details.update({
@@ -1203,6 +1599,7 @@ if selected_page == "Sales Records":
                                     provisioning_date = st.date_input(
                                         "Provisioning date *",
                                         value=parse_db_date(sale.get("provisioning_date"), default=date.today()),
+                                        format="DD-MM-YYYY",
                                         key=f"provisioning_date_{sale_id}",
                                     )
                                 with prov_cols[1]:
@@ -1303,6 +1700,7 @@ if selected_page == "Sales Records":
                         admin_cancel_date = st.date_input(
                             "Cancellation date *",
                             value=existing_cancel_date,
+                            format="DD-MM-YYYY",
                             key=f"admin_cancel_date_{sale_id}",
                         )
                         cancel_button_label = "Update cancellation record" if status == "Cancelled" else "Cancel sale — admin override"
@@ -1335,7 +1733,7 @@ if selected_page == "Sales Records":
                             for entry in history:
                                 with st.container(border=True):
                                     action_name = entry.get("action") or "Update"
-                                    created_at = entry.get("created_at") or "-"
+                                    created_at = format_date(entry.get("created_at"))
                                     st.markdown(f"**{action_name}**")
                                     st.caption(f"{created_at} · By {display_author(entry.get('changed_by'), profile, user_id)}")
                                     previous_stage = entry.get("previous_stage")
@@ -1377,8 +1775,8 @@ if selected_page == "Cancellation Register" and role == "admin":
                     "Assigned department": row.get("assigned_department") or "-",
                     "Status": row.get("status") or "-",
                     "Cancellation reason": row.get("cancellation_reason") or "-",
-                    "Cancellation date": row.get("cancellation_date") or "-",
-                    "Created": row.get("created_at") or "-",
+                    "Cancellation date": format_date(row.get("cancellation_date")),
+                    "Created": format_date(row.get("created_at")),
                     "Reference": row.get("id") or "-",
                 })
             st.caption(f"Showing {len(rows)} of {len(cancelled_sales)} cancelled record(s).")
